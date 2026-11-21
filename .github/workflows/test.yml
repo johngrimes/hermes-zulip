@@ -32,7 +32,8 @@ jobs:
 
       # hermes-agent's uv.lock covers Python 3.14 only.
       - name: Set up uv
-        uses: astral-sh/setup-uv@v10
+        # setup-uv publishes no floating major tag.
+        uses: astral-sh/setup-uv@v10.4.0
         with:
           python-version: "3.14"
 
