@@ -1,0 +1,53 @@
+name: Test against hermes-agent
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The requires_hermes floor in plugin.yaml, and the development tip.
+        hermes-ref: [v0.21.6, main]
+    name: test (hermes-agent ${{ matrix.hermes-ref }})
+    steps:
+      - name: Check out plugin
+        uses: actions/checkout@v7
+        with:
+          path: plugin
+
+      - name: Check out hermes-agent
+        uses: actions/checkout@v7
+        with:
+          repository: NousResearch/hermes-agent
+          ref: ${{ matrix.hermes-ref }}
+          path: hermes-agent
+
+      - name: Report hermes-agent revision
+        run: git -C hermes-agent log -1 --format='hermes-agent %H %cs %s'
+
+      # hermes-agent's uv.lock covers Python 3.14 only.
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v10
+        with:
+          python-version: "3.14"
+
+      - name: Install hermes-agent from its lockfile
+        run: uv sync --project hermes-agent --frozen
+
+      - name: Run plugin tests
+        working-directory: plugin
+        run: uv run --project ../hermes-agent --frozen --with pytest pytest -v
+
+      # Checks the manifest, loads the plugin and resolves python_dependencies
+      # against hermes-agent's own constraints.
+      - name: Validate plugin
+        env:
+          HERMES_HOME: ${{ runner.temp }}/hermes-home
+        run: |
+          mkdir -p "$HERMES_HOME"
+          uv run --project hermes-agent --frozen hermes plugins validate plugin --install-deps

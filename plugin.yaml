@@ -1,0 +1,54 @@
+name: zulip-platform
+label: Zulip
+kind: platform
+version: 1.1.0
+description: >
+  Zulip gateway adapter for Hermes Agent. Connects to a Zulip organisation
+  via the v1 REST API and event-queue long-polling stream and relays
+  messages between Zulip streams/topics and DMs and the Hermes agent.
+  Supports restricting the bot to one stream, @-mention gating, native file
+  uploads, attachment download, and home-channel cron delivery.
+author: John Grimes
+license: MIT
+homepage: https://github.com/johngrimes/hermes-zulip
+requires_hermes: ">=0.21.6"
+python_dependencies:
+  - "aiohttp>=3.9,<4"
+requires_env:
+  - name: ZULIP_SITE
+    description: "Zulip organisation URL (e.g. https://org.zulipchat.com)"
+    prompt: "Zulip server URL"
+    password: false
+  - name: ZULIP_BOT_EMAIL
+    description: "Bot account email"
+    prompt: "Bot email"
+    password: false
+  - name: ZULIP_BOT_API_KEY
+    description: "Bot API key"
+    prompt: "Bot API key"
+    password: true
+optional_env:
+  - name: ZULIP_STREAM
+    description: "Stream the bot operates on. When set, other streams are ignored."
+    prompt: "Stream name"
+    password: false
+  - name: ZULIP_ALLOWED_USERS
+    description: "Comma-separated Zulip user IDs allowed to talk to the bot"
+    prompt: "Allowed users (comma-separated)"
+    password: false
+  - name: ZULIP_ALLOW_ALL_USERS
+    description: "Allow any Zulip user to trigger the bot (dev only)"
+    prompt: "Allow all users? (true/false)"
+    password: false
+  - name: ZULIP_HOME_CHANNEL
+    description: "Default JID (zulip:<stream_id>:<topic> or zulip:dm:<user_id>) for cron delivery"
+    prompt: "Home channel JID"
+    password: false
+  - name: ZULIP_REQUIRE_MENTION
+    description: "Require @bot mention in streams (default true). DMs always pass through."
+    prompt: "Require @mention? (true/false)"
+    password: false
+  - name: ZULIP_FREE_RESPONSE_TOPICS
+    description: "Comma-separated topics where @mention is not required."
+    prompt: "Free-response topics (comma-separated)"
+    password: false

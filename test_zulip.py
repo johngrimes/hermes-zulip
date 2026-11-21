@@ -1,0 +1,188 @@
+"""Tests for the Zulip platform adapter plugin.
+
+Covers the pure helper functions that drive JID routing, outbound payload
+construction, inbound HTML normalisation, attachment link extraction, and
+mention stripping. These are the highest-correctness surfaces of the
+adapter - the bits that, if wrong, route messages to the wrong place or
+drop attachments silently.
+
+Author: John Grimes
+"""
+
+import importlib.util
+import pathlib
+
+import pytest
+
+# The plugin is loaded by Hermes dynamically by file path (it is not on the
+# normal package path), so resolve the adapter module the same way here.
+_ADAPTER_PATH = (
+    pathlib.Path(__file__).parent / "adapter.py"
+)
+_spec = importlib.util.spec_from_file_location("zulip_adapter_under_test", _ADAPTER_PATH)
+adapter = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(adapter)
+
+MAX_MESSAGE_LENGTH = adapter.MAX_MESSAGE_LENGTH
+build_send_params = adapter.build_send_params
+encode_form_params = adapter.encode_form_params
+extract_attachment_links = adapter.extract_attachment_links
+html_to_text = adapter.html_to_text
+parse_jid = adapter.parse_jid
+strip_mention = adapter.strip_mention
+
+
+class TestParseJid:
+    def test_stream_jid_parses_to_stream_id_and_topic(self):
+        parsed = parse_jid("zulip:42:general")
+        assert parsed == {"type": "stream", "stream_id": 42, "topic": "general"}
+
+    def test_dm_jid_parses_to_user_id(self):
+        parsed = parse_jid("zulip:dm:7")
+        assert parsed == {"type": "dm", "user_id": 7}
+
+    def test_stream_jid_preserves_topic_with_colons(self):
+        # Topics may contain colons (e.g. "release: 1.2"). Only the first
+        # colon after the stream id splits the topic.
+        parsed = parse_jid("zulip:42:release: 1.2")
+        assert parsed == {"type": "stream", "stream_id": 42, "topic": "release: 1.2"}
+
+    def test_non_zulip_jid_returns_none(self):
+        assert parse_jid("telegram:12345") is None
+
+    def test_missing_prefix_returns_none(self):
+        assert parse_jid("5:general") is None
+
+    def test_non_numeric_stream_id_returns_none(self):
+        assert parse_jid("zulip:abc:general") is None
+
+    def test_non_numeric_dm_user_id_returns_none(self):
+        assert parse_jid("zulip:dm:abc") is None
+
+    def test_empty_topic_returns_none(self):
+        assert parse_jid("zulip:42:") is None
+
+    def test_dm_without_user_id_returns_none(self):
+        assert parse_jid("zulip:dm:") is None
+
+
+class TestBuildSendParams:
+    def test_stream_payload_uses_stream_id_and_topic(self):
+        params = build_send_params("zulip:42:general", "hello")
+        assert params == {
+            "type": "stream",
+            "to": 42,
+            "topic": "general",
+            "content": "hello",
+        }
+
+    def test_dm_payload_uses_direct_type_and_user_list(self):
+        params = build_send_params("zulip:dm:7", "hello")
+        assert params == {
+            "type": "direct",
+            "to": [7],
+            "content": "hello",
+        }
+
+    def test_invalid_jid_returns_none(self):
+        assert build_send_params("telegram:1", "hello") is None
+
+
+class TestHtmlToText:
+    def test_strips_simple_tags(self):
+        assert html_to_text("<p>hello</p>") == "hello"
+
+    def test_converts_breaks_and_paragraphs_to_newlines(self):
+        assert html_to_text("<p>one</p><br><p>two</p>") == "one\ntwo"
+
+    def test_decodes_entities(self):
+        assert html_to_text("a &amp; b &lt; c") == "a & b < c"
+
+    def test_collapses_whitespace(self):
+        assert html_to_text("<p>hello   world</p>") == "hello world"
+
+    def test_preserves_code_content(self):
+        # Code blocks should keep their text content intact.
+        assert html_to_text("<pre>line1\nline2</pre>") == "line1\nline2"
+
+    def test_empty_input_returns_empty(self):
+        assert html_to_text("") == ""
+
+    def test_user_mention_link_text_is_preserved(self):
+        # Zulip renders @mentions as <a> links; the visible text matters.
+        assert html_to_text('<p><span class="user-mention">@John</span> hi</p>') == "@John hi"
+
+
+class TestExtractAttachmentLinks:
+    def test_finds_user_upload_anchor(self):
+        html = '<a href="/user_uploads/abc/file.txt">file.txt</a>'
+        links = extract_attachment_links(html)
+        assert links == [("/user_uploads/abc/file.txt", "file.txt")]
+
+    def test_ignores_non_upload_links(self):
+        html = '<a href="https://example.com/page">page</a>'
+        assert extract_attachment_links(html) == []
+
+    def test_finds_multiple_uploads(self):
+        html = (
+            '<a href="/user_uploads/a/1.png">1.png</a>'
+            '<a href="/user_uploads/b/2.pdf">2.pdf</a>'
+        )
+        links = extract_attachment_links(html)
+        assert links == [
+            ("/user_uploads/a/1.png", "1.png"),
+            ("/user_uploads/b/2.pdf", "2.pdf"),
+        ]
+
+    def test_absolute_upload_urls_are_kept(self):
+        # Zulip sometimes returns absolute URLs for uploads.
+        html = '<a href="https://example.zulipchat.com/user_uploads/x/y.bin">y.bin</a>'
+        links = extract_attachment_links(html)
+        assert len(links) == 1
+        assert links[0][1] == "y.bin"
+
+    def test_no_links_returns_empty(self):
+        assert extract_attachment_links("plain text") == []
+
+
+class TestStripMention:
+    def test_strips_at_username(self):
+        assert strip_mention("@hermes-bot hello", ["hermes-bot"]) == "hello"
+
+    def test_strips_at_user_id(self):
+        assert strip_mention("@12 hello", ["hermes-bot", "12"]) == "hello"
+
+    def test_case_insensitive(self):
+        assert strip_mention("@HERMES-BOT hi", ["hermes-bot"]) == "hi"
+
+    def test_no_mention_returns_unchanged(self):
+        assert strip_mention("hello there", ["hermes-bot"]) == "hello there"
+
+    def test_strips_multiple_mentions(self):
+        assert strip_mention("@hermes-bot @hermes-bot hi", ["hermes-bot"]) == "hi"
+
+
+class TestEncodeFormParams:
+    def test_stream_to_stays_as_integer_string(self):
+        params = build_send_params("zulip:42:general", "hi")
+        encoded = encode_form_params(params)
+        assert encoded["to"] == "42"
+        assert encoded["type"] == "stream"
+
+    def test_dm_to_becomes_json_array_string(self):
+        params = build_send_params("zulip:dm:7", "hi")
+        encoded = encode_form_params(params)
+        assert encoded["to"] == "[7]"
+        assert encoded["type"] == "direct"
+
+    def test_content_passes_through(self):
+        params = build_send_params("zulip:42:general", "hello world")
+        encoded = encode_form_params(params)
+        assert encoded["content"] == "hello world"
+
+
+class TestMaxMessageLength:
+    def test_zulip_limit_is_reasonable(self):
+        # Zulip's hard limit is 10000 chars; the adapter must chunk above it.
+        assert MAX_MESSAGE_LENGTH <= 10000
+        assert MAX_MESSAGE_LENGTH > 0
