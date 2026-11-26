@@ -126,6 +126,26 @@ def parse_jid(jid: str) -> Optional[Dict[str, Any]]:
     return {"type": "stream", "stream_id": stream_id, "topic": topic}
 
 
+def parse_target_ref(target_ref: str) -> Optional[Tuple[str, Optional[str]]]:
+    """Turn a delivery target into a Zulip JID for Hermes's target resolution.
+
+    Hermes splits ``deliver`` / ``send_message`` targets as ``platform:rest`` and
+    passes only ``rest`` on, so ``zulip:42:general`` arrives here as
+    ``42:general``. Restore the ``zulip:`` prefix the adapter's JIDs carry, so
+    cron delivery reaches the right topic and the brief is seeded into the
+    same session that replies in that topic use.
+
+    @param target_ref - The target with or without the ``zulip:`` prefix.
+    @returns ``(jid, None)`` for a stream topic or DM target, or None to let
+        Hermes fall back to channel-name resolution.
+    """
+    ref = (target_ref or "").strip()
+    jid = ref if ref.startswith("zulip:") else f"zulip:{ref}"
+    if parse_jid(jid) is None:
+        return None
+    return jid, None
+
+
 def parseIntSafe(value: str) -> Optional[int]:
     """Parse an integer, returning None on failure instead of raising."""
     try:
@@ -1018,6 +1038,7 @@ def register(ctx) -> None:
         allowed_users_env="ZULIP_ALLOWED_USERS",
         allow_all_env="ZULIP_ALLOW_ALL_USERS",
         cron_deliver_env_var="ZULIP_HOME_CHANNEL",
+        parse_target_ref_fn=parse_target_ref,
         standalone_sender_fn=_standalone_send,
         max_message_length=MAX_MESSAGE_LENGTH,
         emoji="💬",

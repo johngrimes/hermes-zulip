@@ -31,6 +31,7 @@ html_to_text = adapter.html_to_text
 parse_jid = adapter.parse_jid
 strip_mention = adapter.strip_mention
 is_bot_mentioned = adapter.is_bot_mentioned
+parse_target_ref = getattr(adapter, "parse_target_ref", None)
 
 
 class TestParseJid:
@@ -65,6 +66,32 @@ class TestParseJid:
 
     def test_dm_without_user_id_returns_none(self):
         assert parse_jid("zulip:dm:") is None
+
+
+class TestParseTargetRef:
+    """Hermes strips the platform prefix from delivery targets ("zulip:42:general"
+    reaches the plugin as "42:general"), so the parser restores the full JID."""
+
+    def test_stream_topic_without_prefix(self):
+        assert parse_target_ref("659014:Morning brief") == ("zulip:659014:Morning brief", None)
+
+    def test_dm_without_prefix(self):
+        assert parse_target_ref("dm:7") == ("zulip:dm:7", None)
+
+    def test_full_jid_passes_through(self):
+        assert parse_target_ref("zulip:42:general") == ("zulip:42:general", None)
+
+    def test_topic_with_colons(self):
+        assert parse_target_ref("42:a:b") == ("zulip:42:a:b", None)
+
+    def test_surrounding_whitespace_is_ignored(self):
+        assert parse_target_ref("  42:general ") == ("zulip:42:general", None)
+
+    def test_channel_name_is_left_to_core_resolution(self):
+        assert parse_target_ref("briefs") is None
+
+    def test_missing_topic_is_not_a_target(self):
+        assert parse_target_ref("42:") is None
 
 
 class TestBuildSendParams:
