@@ -995,6 +995,30 @@ async def _standalone_send(
 _is_connected = env_is_connected("ZULIP_SITE", "ZULIP_BOT_EMAIL", "ZULIP_BOT_API_KEY")
 
 
+def _env_enablement() -> Optional[dict]:
+    """Seed ``PlatformConfig.extra`` from the profile's env before the adapter is built.
+
+    Core lifts ``home_channel`` into the platform's home channel, which drives
+    startup notices and the "no home channel" check. Without this hook
+    ``ZULIP_HOME_CHANNEL`` only reaches cron delivery.
+
+    @returns The seed, or None when Zulip isn't configured.
+    """
+    if not all(
+        get_scoped_secret(name, "").strip()
+        for name in ("ZULIP_SITE", "ZULIP_BOT_EMAIL", "ZULIP_BOT_API_KEY")
+    ):
+        return None
+    seed: dict = {}
+    home = get_scoped_secret("ZULIP_HOME_CHANNEL", "").strip()
+    if home:
+        seed["home_channel"] = {
+            "chat_id": home,
+            "name": get_scoped_secret("ZULIP_HOME_CHANNEL_NAME", "").strip() or "Home",
+        }
+    return seed
+
+
 # ---------------------------------------------------------------------------
 # YAML -> env config bridge
 # ---------------------------------------------------------------------------
@@ -1037,6 +1061,7 @@ def register(ctx) -> None:
         apply_yaml_config_fn=_apply_yaml_config,
         allowed_users_env="ZULIP_ALLOWED_USERS",
         allow_all_env="ZULIP_ALLOW_ALL_USERS",
+        env_enablement_fn=_env_enablement,
         cron_deliver_env_var="ZULIP_HOME_CHANNEL",
         parse_target_ref_fn=parse_target_ref,
         standalone_sender_fn=_standalone_send,

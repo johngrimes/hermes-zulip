@@ -320,3 +320,33 @@ class TestStandaloneSend:
         expected = base64.b64encode(b"hermes-bot@example.zulipchat.com:secret-key").decode("ascii")
         assert call["headers"]["Authorization"] == "Basic " + expected
         assert call["data"]["topic"] == "Morning brief"
+
+
+class TestEnvEnablement:
+    """ZULIP_HOME_CHANNEL must reach core as the platform's home channel, or
+    startup notices and the no-home-channel check ignore it."""
+
+    @pytest.fixture(autouse=True)
+    def _creds(self, monkeypatch):
+        monkeypatch.setenv("ZULIP_SITE", "https://example.zulipchat.com")
+        monkeypatch.setenv("ZULIP_BOT_EMAIL", "bot@example.zulipchat.com")
+        monkeypatch.setenv("ZULIP_BOT_API_KEY", "key")
+        monkeypatch.delenv("ZULIP_HOME_CHANNEL", raising=False)
+        monkeypatch.delenv("ZULIP_HOME_CHANNEL_NAME", raising=False)
+
+    def test_home_channel_is_seeded(self, monkeypatch):
+        monkeypatch.setenv("ZULIP_HOME_CHANNEL", "zulip:42:Hermes")
+        seed = adapter._env_enablement()
+        assert seed["home_channel"] == {"chat_id": "zulip:42:Hermes", "name": "Home"}
+
+    def test_home_channel_name_is_used(self, monkeypatch):
+        monkeypatch.setenv("ZULIP_HOME_CHANNEL", "zulip:42:Hermes")
+        monkeypatch.setenv("ZULIP_HOME_CHANNEL_NAME", "logs")
+        assert adapter._env_enablement()["home_channel"]["name"] == "logs"
+
+    def test_no_home_channel_seeds_none(self):
+        assert "home_channel" not in adapter._env_enablement()
+
+    def test_unconfigured_returns_none(self, monkeypatch):
+        monkeypatch.delenv("ZULIP_BOT_API_KEY")
+        assert adapter._env_enablement() is None
