@@ -47,7 +47,7 @@ Set these in the profile's `.env` (or any secret source Hermes supports):
 | `ZULIP_STREAM` | no | Name of the only stream the bot responds in. Without it, the bot responds in every stream it is subscribed to. |
 | `ZULIP_ALLOWED_USERS` | no | Comma-separated Zulip user IDs allowed to talk to the bot |
 | `ZULIP_ALLOW_ALL_USERS` | no | `true` lets any user talk to the bot (development only) |
-| `ZULIP_HOME_CHANNEL` | no | Chat ID that cron output is delivered to (see below) |
+| `ZULIP_HOME_CHANNEL` | no | Chat ID for cron output and Hermes status notices, such as the startup notice (see below) |
 | `ZULIP_REQUIRE_MENTION` | no | Require an @-mention in streams (default `true`) |
 | `ZULIP_FREE_RESPONSE_TOPICS` | no | Comma-separated topics where no @-mention is needed |
 

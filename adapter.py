@@ -30,6 +30,7 @@ Author: John Grimes
 from __future__ import annotations
 
 import asyncio
+import base64
 import html as html_lib
 import logging
 import os
@@ -125,6 +126,26 @@ def parse_jid(jid: str) -> Optional[Dict[str, Any]]:
     return {"type": "stream", "stream_id": stream_id, "topic": topic}
 
 
+def parse_target_ref(target_ref: str) -> Optional[Tuple[str, Optional[str]]]:
+    """Turn a delivery target into a Zulip JID for Hermes's target resolution.
+
+    Hermes splits ``deliver`` / ``send_message`` targets as ``platform:rest`` and
+    passes only ``rest`` on, so ``zulip:42:general`` arrives here as
+    ``42:general``. Restore the ``zulip:`` prefix the adapter's JIDs carry, so
+    cron delivery reaches the right topic and the brief is seeded into the
+    same session that replies in that topic use.
+
+    @param target_ref - The target with or without the ``zulip:`` prefix.
+    @returns ``(jid, None)`` for a stream topic or DM target, or None to let
+        Hermes fall back to channel-name resolution.
+    """
+    ref = (target_ref or "").strip()
+    jid = ref if ref.startswith("zulip:") else f"zulip:{ref}"
+    if parse_jid(jid) is None:
+        return None
+    return jid, None
+
+
 def parseIntSafe(value: str) -> Optional[int]:
     """Parse an integer, returning None on failure instead of raising."""
     try:
@@ -198,24 +219,69 @@ def extract_attachment_links(html: str) -> List[Tuple[str, str]]:
     return results
 
 
+# Opening <span> tags; Zulip renders user mentions as
+# <span class="user-mention" data-user-id="...">@Name</span>.
+_SPAN_TAG_RE = re.compile(r"<span\b[^>]*>", re.IGNORECASE)
+_DATA_USER_ID_RE = re.compile(r'data-user-id="([^"]*)"', re.IGNORECASE)
+
+
+def _at_mention_pattern(token: str) -> str:
+    """Regex for "@token" as a whole mention (not inside a longer name)."""
+    return r"(?<![\w@])@" + re.escape(token) + r"(?![\w-])"
+
+
+def is_bot_mentioned(
+    flags: Optional[List[str]],
+    html: str,
+    text: str,
+    bot_user_id: Optional[int],
+    mention_tokens: List[str],
+) -> bool:
+    """Decide whether a stream message mentions the bot.
+
+    Trusts Zulip's own signals first: the ``mentioned`` message flag, then a
+    rendered user-mention span carrying the bot's user ID. Falls back to an
+    explicit ``@token`` in the text. A token is never matched without its
+    ``@``, so ordinary words and numbers (such as the bot's user ID) in a
+    message are not mistaken for a mention.
+
+    @param flags - The event's message flags (e.g. ["read", "mentioned"]).
+    @param html - The rendered HTML content of the message.
+    @param text - The plain-text form of the message.
+    @param bot_user_id - The bot's Zulip user ID, if known.
+    @param mention_tokens - Strings the bot can be @-mentioned with.
+    @returns True when the message mentions the bot.
+    """
+    if flags and "mentioned" in flags:
+        return True
+    if bot_user_id is not None:
+        for tag in _SPAN_TAG_RE.finditer(html or ""):
+            if "user-mention" not in tag.group(0):
+                continue
+            uid = _DATA_USER_ID_RE.search(tag.group(0))
+            if uid and uid.group(1) == str(bot_user_id):
+                return True
+    return any(
+        token and re.search(_at_mention_pattern(token), text or "", flags=re.IGNORECASE)
+        for token in mention_tokens
+    )
+
+
 def strip_mention(text: str, mention_tokens: List[str]) -> str:
-    """Remove @-mention tokens from a message so the agent sees clean input.
+    """Remove @-mentions of the bot so the agent sees clean input.
+
+    Only ``@token`` forms are removed, longest token first so a full name
+    ("@Hermes Bot") wins over a shorter username ("@hermes"). Bare words and
+    numbers are left alone.
 
     @param text - The raw message text.
     @param mention_tokens - Strings the platform uses to mention the bot (e.g. username, user id).
-    @returns The text with leading mentions removed.
+    @returns The text with the bot's mentions removed.
     """
     cleaned = text
-    for token in mention_tokens:
-        if not token:
-            continue
-        cleaned = re.sub(
-            r"@?" + re.escape(token) + r"\b",
-            "",
-            cleaned,
-            flags=re.IGNORECASE,
-        )
-    return cleaned.strip()
+    for token in sorted((t for t in mention_tokens if t), key=len, reverse=True):
+        cleaned = re.sub(_at_mention_pattern(token), "", cleaned, flags=re.IGNORECASE)
+    return re.sub(r"[^\S\n]{2,}", " ", cleaned).strip()
 
 
 class ZulipAdapter(BasePlatformAdapter):
@@ -258,8 +324,6 @@ class ZulipAdapter(BasePlatformAdapter):
 
     def _auth(self) -> str:
         # Zulip uses HTTP Basic auth with "email:api_key", base64-encoded.
-        import base64
-
         token = f"{self._email}:{self._api_key}"
         return "Basic " + base64.b64encode(token.encode("utf-8")).decode("ascii")
 
@@ -717,9 +781,13 @@ class ZulipAdapter(BasePlatformAdapter):
                 free_topics_raw = ",".join(str(t) for t in free_topics_raw)
             free_topics = {t.strip() for t in str(free_topics_raw).split(",") if t.strip()}
             mention_tokens = self._mention_tokens()
-            has_mention = any(
-                f"@{tok}".lower() in text.lower() for tok in mention_tokens
-            ) or any(tok and tok.lower() in text.lower() for tok in mention_tokens)
+            has_mention = is_bot_mentioned(
+                event.get("flags"),
+                msg.get("content", ""),
+                text,
+                self._bot_user_id,
+                mention_tokens,
+            )
             if require_mention and topic not in free_topics and not has_mention:
                 logger.debug("Zulip: skipping stream message without @mention (%s)", chat_jid)
                 return
@@ -927,6 +995,30 @@ async def _standalone_send(
 _is_connected = env_is_connected("ZULIP_SITE", "ZULIP_BOT_EMAIL", "ZULIP_BOT_API_KEY")
 
 
+def _env_enablement() -> Optional[dict]:
+    """Seed ``PlatformConfig.extra`` from the profile's env before the adapter is built.
+
+    Core lifts ``home_channel`` into the platform's home channel, which drives
+    startup notices and the "no home channel" check. Without this hook
+    ``ZULIP_HOME_CHANNEL`` only reaches cron delivery.
+
+    @returns The seed, or None when Zulip isn't configured.
+    """
+    if not all(
+        get_scoped_secret(name, "").strip()
+        for name in ("ZULIP_SITE", "ZULIP_BOT_EMAIL", "ZULIP_BOT_API_KEY")
+    ):
+        return None
+    seed: dict = {}
+    home = get_scoped_secret("ZULIP_HOME_CHANNEL", "").strip()
+    if home:
+        seed["home_channel"] = {
+            "chat_id": home,
+            "name": get_scoped_secret("ZULIP_HOME_CHANNEL_NAME", "").strip() or "Home",
+        }
+    return seed
+
+
 # ---------------------------------------------------------------------------
 # YAML -> env config bridge
 # ---------------------------------------------------------------------------
@@ -969,7 +1061,9 @@ def register(ctx) -> None:
         apply_yaml_config_fn=_apply_yaml_config,
         allowed_users_env="ZULIP_ALLOWED_USERS",
         allow_all_env="ZULIP_ALLOW_ALL_USERS",
+        env_enablement_fn=_env_enablement,
         cron_deliver_env_var="ZULIP_HOME_CHANNEL",
+        parse_target_ref_fn=parse_target_ref,
         standalone_sender_fn=_standalone_send,
         max_message_length=MAX_MESSAGE_LENGTH,
         emoji="💬",

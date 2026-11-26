@@ -30,6 +30,8 @@ extract_attachment_links = adapter.extract_attachment_links
 html_to_text = adapter.html_to_text
 parse_jid = adapter.parse_jid
 strip_mention = adapter.strip_mention
+is_bot_mentioned = adapter.is_bot_mentioned
+parse_target_ref = getattr(adapter, "parse_target_ref", None)
 
 
 class TestParseJid:
@@ -64,6 +66,32 @@ class TestParseJid:
 
     def test_dm_without_user_id_returns_none(self):
         assert parse_jid("zulip:dm:") is None
+
+
+class TestParseTargetRef:
+    """Hermes strips the platform prefix from delivery targets ("zulip:42:general"
+    reaches the plugin as "42:general"), so the parser restores the full JID."""
+
+    def test_stream_topic_without_prefix(self):
+        assert parse_target_ref("659014:Morning brief") == ("zulip:659014:Morning brief", None)
+
+    def test_dm_without_prefix(self):
+        assert parse_target_ref("dm:7") == ("zulip:dm:7", None)
+
+    def test_full_jid_passes_through(self):
+        assert parse_target_ref("zulip:42:general") == ("zulip:42:general", None)
+
+    def test_topic_with_colons(self):
+        assert parse_target_ref("42:a:b") == ("zulip:42:a:b", None)
+
+    def test_surrounding_whitespace_is_ignored(self):
+        assert parse_target_ref("  42:general ") == ("zulip:42:general", None)
+
+    def test_channel_name_is_left_to_core_resolution(self):
+        assert parse_target_ref("briefs") is None
+
+    def test_missing_topic_is_not_a_target(self):
+        assert parse_target_ref("42:") is None
 
 
 class TestBuildSendParams:
@@ -161,6 +189,50 @@ class TestStripMention:
     def test_strips_multiple_mentions(self):
         assert strip_mention("@hermes-bot @hermes-bot hi", ["hermes-bot"]) == "hi"
 
+    def test_strips_full_name_with_spaces(self):
+        assert strip_mention("@Hermes Bot what's next?", ["hermes-bot", "Hermes Bot"]) == "what's next?"
+
+    def test_leaves_numbers_matching_user_id_untouched(self):
+        # The bot's user ID is a mention token, but a bare number in the text
+        # is not a mention and must reach the agent intact.
+        assert strip_mention("What's on 12 Dec?", ["hermes-bot", "12"]) == "What's on 12 Dec?"
+
+    def test_leaves_unprefixed_name_untouched(self):
+        assert strip_mention("is hermes-bot up?", ["hermes-bot"]) == "is hermes-bot up?"
+
+    def test_prefers_full_name_over_shorter_username(self):
+        assert strip_mention("@Hermes Bot hi", ["hermes", "Hermes Bot"]) == "hi"
+
+    def test_does_not_strip_a_longer_name(self):
+        assert strip_mention("@hermes-bot2 hi", ["hermes-bot"]) == "@hermes-bot2 hi"
+
+
+class TestIsBotMentioned:
+    TOKENS = ["hermes-bot", "Hermes Bot", "12"]
+
+    def test_mentioned_flag(self):
+        assert is_bot_mentioned(["read", "mentioned"], "<p>hi</p>", "hi", 12, self.TOKENS)
+
+    def test_user_mention_span_for_bot(self):
+        html = '<p><span class="user-mention" data-user-id="12">@Hermes Bot</span> hi</p>'
+        assert is_bot_mentioned([], html, "@Hermes Bot hi", 12, self.TOKENS)
+
+    def test_user_mention_span_for_someone_else(self):
+        html = '<p><span class="user-mention" data-user-id="99">@Alice</span> hi</p>'
+        assert not is_bot_mentioned([], html, "@Alice hi", 12, self.TOKENS)
+
+    def test_at_name_in_text(self):
+        assert is_bot_mentioned([], "", "@hermes-bot hello", 12, self.TOKENS)
+
+    def test_number_matching_user_id_is_not_a_mention(self):
+        assert not is_bot_mentioned([], "<p>meet at 12 tomorrow</p>", "meet at 12 tomorrow", 12, self.TOKENS)
+
+    def test_name_without_at_is_not_a_mention(self):
+        assert not is_bot_mentioned([], "", "is hermes-bot up?", 12, self.TOKENS)
+
+    def test_no_flags(self):
+        assert not is_bot_mentioned(None, "", "hello", 12, self.TOKENS)
+
 
 class TestEncodeFormParams:
     def test_stream_to_stays_as_integer_string(self):
@@ -186,3 +258,95 @@ class TestMaxMessageLength:
         # Zulip's hard limit is 10000 chars; the adapter must chunk above it.
         assert MAX_MESSAGE_LENGTH <= 10000
         assert MAX_MESSAGE_LENGTH > 0
+
+
+class _FakeResponse:
+    def __init__(self, body):
+        self._body = body
+
+    async def json(self):
+        return self._body
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _FakeSession:
+    calls = []
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    def post(self, url, headers=None, data=None):
+        _FakeSession.calls.append({"url": url, "headers": headers, "data": data})
+        return _FakeResponse({"result": "success", "id": 555})
+
+
+class _PConfig:
+    extra = {"site": "https://example.zulipchat.com/", "bot_email": "hermes-bot@example.zulipchat.com"}
+    token = "secret-key"
+
+
+class TestStandaloneSend:
+    def test_sends_message_with_basic_auth(self, monkeypatch):
+        import asyncio
+        import base64
+        import sys
+        import types
+
+        # aiohttp is an optional Hermes extra, so stub the parts the sender uses.
+        fake_aiohttp = types.ModuleType("aiohttp")
+        fake_aiohttp.ClientSession = _FakeSession
+        fake_aiohttp.ClientTimeout = lambda **kwargs: None
+        fake_aiohttp.ClientError = type("ClientError", (Exception,), {})
+        monkeypatch.setitem(sys.modules, "aiohttp", fake_aiohttp)
+
+        _FakeSession.calls = []
+        result = asyncio.run(adapter._standalone_send(_PConfig(), "zulip:42:Morning brief", "hello"))
+
+        assert result.get("success") is True, result
+        assert result["message_id"] == "555"
+        call = _FakeSession.calls[-1]
+        assert call["url"] == "https://example.zulipchat.com/api/v1/messages"
+        expected = base64.b64encode(b"hermes-bot@example.zulipchat.com:secret-key").decode("ascii")
+        assert call["headers"]["Authorization"] == "Basic " + expected
+        assert call["data"]["topic"] == "Morning brief"
+
+
+class TestEnvEnablement:
+    """ZULIP_HOME_CHANNEL must reach core as the platform's home channel, or
+    startup notices and the no-home-channel check ignore it."""
+
+    @pytest.fixture(autouse=True)
+    def _creds(self, monkeypatch):
+        monkeypatch.setenv("ZULIP_SITE", "https://example.zulipchat.com")
+        monkeypatch.setenv("ZULIP_BOT_EMAIL", "bot@example.zulipchat.com")
+        monkeypatch.setenv("ZULIP_BOT_API_KEY", "key")
+        monkeypatch.delenv("ZULIP_HOME_CHANNEL", raising=False)
+        monkeypatch.delenv("ZULIP_HOME_CHANNEL_NAME", raising=False)
+
+    def test_home_channel_is_seeded(self, monkeypatch):
+        monkeypatch.setenv("ZULIP_HOME_CHANNEL", "zulip:42:Hermes")
+        seed = adapter._env_enablement()
+        assert seed["home_channel"] == {"chat_id": "zulip:42:Hermes", "name": "Home"}
+
+    def test_home_channel_name_is_used(self, monkeypatch):
+        monkeypatch.setenv("ZULIP_HOME_CHANNEL", "zulip:42:Hermes")
+        monkeypatch.setenv("ZULIP_HOME_CHANNEL_NAME", "logs")
+        assert adapter._env_enablement()["home_channel"]["name"] == "logs"
+
+    def test_no_home_channel_seeds_none(self):
+        assert "home_channel" not in adapter._env_enablement()
+
+    def test_unconfigured_returns_none(self, monkeypatch):
+        monkeypatch.delenv("ZULIP_BOT_API_KEY")
+        assert adapter._env_enablement() is None
